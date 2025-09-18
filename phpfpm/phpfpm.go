@@ -17,7 +17,8 @@ package phpfpm
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -148,37 +149,22 @@ func (pm *PoolManager) Update() (err error) {
 }
 
 // Update will connect to PHP-FPM and retrieve the latest data for the pool.
-func (p *Pool) Update() (err error) {
+func (p *Pool) Update() error {
 	p.ScrapeError = nil
-
+	var (
+		content []byte
+		err     error
+	)
 	scheme, address, path, err := parseURL(p.Address)
 	if err != nil {
 		return p.error(err)
 	}
 
-	fcgi, err := fcgiclient.DialTimeout(scheme, address, time.Duration(3)*time.Second)
-	if err != nil {
-		return p.error(err)
+	if scheme != "http" && scheme != "https" {
+		content, err = p.tcpRequest(scheme, address, path)
+	} else {
+		content, err = p.getDataHTTP(p.Address)
 	}
-
-	defer fcgi.Close()
-
-	env := map[string]string{
-		"SCRIPT_FILENAME": path,
-		"SCRIPT_NAME":     path,
-		"SERVER_SOFTWARE": "go / php-fpm_exporter",
-		"REMOTE_ADDR":     "127.0.0.1",
-		"QUERY_STRING":    "json&full",
-	}
-
-	resp, err := fcgi.Get(env)
-	if err != nil {
-		return p.error(err)
-	}
-
-	defer resp.Body.Close()
-
-	content, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return p.error(err)
 	}
@@ -193,6 +179,59 @@ func (p *Pool) Update() (err error) {
 	}
 
 	return nil
+}
+
+func (p *Pool) tcpRequest(scheme string, address string, path string) ([]byte, error) {
+	fcgi, err := fcgiclient.DialTimeout(scheme, address, time.Duration(3)*time.Second)
+	if err != nil {
+		return nil, p.error(err)
+	}
+
+	defer fcgi.Close()
+
+	env := map[string]string{
+		"SCRIPT_FILENAME": path,
+		"SCRIPT_NAME":     path,
+		"SERVER_SOFTWARE": "go / php-fpm_exporter",
+		"REMOTE_ADDR":     "127.0.0.1",
+		"QUERY_STRING":    "json&full",
+	}
+
+	resp, err := fcgi.Get(env)
+	if err != nil {
+		return nil, p.error(err)
+	}
+
+	content, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, p.error(err)
+	}
+
+	defer resp.Body.Close()
+	return content, nil
+}
+
+func (p *Pool) getDataHTTP(uri string) ([]byte, error) {
+
+	req, _ := http.NewRequest("GET", uri, nil)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, p.error(err)
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, p.error(fmt.Errorf("unexpected HTTP status: %d", resp.StatusCode))
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, p.error(err)
+	}
+
+	return body, nil
 }
 
 func (p *Pool) error(err error) error {
